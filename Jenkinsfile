@@ -2,75 +2,93 @@ pipeline {
     agent {
         docker {
             image 'python:3.9-slim'
-            args '-u root' // if you need to run as root (use only if needed)
+            // Remove -u root if possible (add jenkins user to docker group instead)
+            args '-v /var/run/docker.sock:/var/run/docker.sock' 
         }
     }
+    
     environment {
         APP_DIR = '/app'
         REPO_URL = 'https://github.com/blackkolly/dockerizing-jenkins.git'
-        SONARQUBE_SERVER = 'sonarqube'
-        SONAR_HOST_URL = 'http://98.66.213.81:9000' // Add SonarQube URL
-        SONAR_AUTH_TOKEN = credentials('squ_dc26c2b6e3b740bdb2fe363751de6a892566043f') // Ensure you add this credential
+        DOCKER_IMAGE = 'blackkolly/django_app'
+        // Choose ONE SonarQube approach:
+        // EITHER use withSonarQubeEnv:
+        SONARQUBE_SERVER = 'sonarqube' 
+        // OR use direct URL:
+        // SONAR_HOST_URL = 'http://98.66.213.81:9000'
     }
+    
     stages {
         stage('Checkout') {
             steps {
                 git branch: 'main', url: env.REPO_URL
             }
         }
+        
         stage('Build App') {
             steps {
-                sh 'pip install -r requirements.txt'
+                sh 'pip install --no-cache-dir -r requirements.txt'
                 sh 'python manage.py migrate'
             }
         }
+        
         stage('Run Tests') {
             steps {
                 sh 'python manage.py test'
             }
         }
+        
         stage('SonarQube Analysis') {
             steps {
-                script {
-                    withSonarQubeEnv(env.SONARQUBE_SERVER) {
-                        sh '''
-                        sonar-scanner \
-                        -Dsonar.projectKey=django_app \
-                        -Dsonar.sources=. \
-                        -Dsonar.host.url=${SONAR_HOST_URL} \
-                        -Dsonar.login=${SONAR_AUTH_TOKEN}
-                        '''
-                    }
+                withSonarQubeEnv(env.SONARQUBE_SERVER) {
+                    sh '''
+                    sonar-scanner \
+                    -Dsonar.projectKey=django_app \
+                    -Dsonar.sources=. \
+                    -Dsonar.python.version=3.9
+                    '''
                 }
             }
         }
+        
         stage('Build Docker Image') {
             steps {
                 script {
                     docker.withRegistry('', 'docker-hub-credentials-id') {
-                        def appImage = docker.build("blackkolly/django_app:${env.BUILD_NUMBER}")
+                        def appImage = docker.build("${env.DOCKER_IMAGE}:${env.BUILD_NUMBER}")
                         appImage.push()
+                        // Tag as latest
+                        appImage.push('latest')
                     }
                 }
             }
         }
+        
         stage('Deploy App') {
             steps {
                 script {
-                    sh 'docker-compose up -d'
+                    // Use specific version rather than latest for production
+                    sh "docker-compose pull"
+                    sh "docker-compose up -d --no-deps --build web"
                 }
             }
         }
     }
+    
     post {
         always {
             cleanWs()
+            script {
+                // Clean up dangling images
+                sh 'docker system prune -f || true'
+            }
         }
         success {
-            echo 'Pipeline completed successfully!'
+            slackSend(color: 'good', message: "Pipeline SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}")
         }
         failure {
-            echo 'Pipeline failed!'
+            slackSend(color: 'danger', message: "Pipeline FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}")
         }
     }
 }
+          
